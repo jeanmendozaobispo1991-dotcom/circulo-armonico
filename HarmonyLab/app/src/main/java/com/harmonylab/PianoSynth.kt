@@ -23,27 +23,121 @@ object PianoSynth {
     private val cache = ConcurrentHashMap<Int, FloatArray>()
     private val active = AtomicInteger(0)
 
-    /** Secuencia ya renderizada, lista para reproducirse (con o sin loop). */
-    class Sequence(
-        private val track: AudioTrack,
-        private val frames: Int,
-        private val bpm: Int,
-        private val loop: Boolean
-    ) {
-        fun start() { track.play() }
+    private const val CHUNK = 2048
 
-        /** Posición actual en pulsos, leída directamente del audio (sincronía exacta). */
-        fun beat(): Float {
-            val head = track.playbackHeadPosition
-            val f = if (loop) head % frames else head
-            return f.toFloat() / SR * bpm / 60f
+    /**
+     * Secuencia en reproducción. Usa un flujo de audio continuo para poder cambiar
+     * el contenido del loop, sin cortes, cuando termina cada vuelta.
+     */
+    class Sequence(private val firstBuf: ShortArray, private val firstBpm: Int, val isLoop: Boolean) {
+        private class Seg(val start: Long, val frames: Int, val bpm: Int)
+
+        private val track: AudioTrack
+        private val segs = ArrayList<Seg>()
+        @Volatile private var pending: ShortArray? = null
+        @Volatile private var pendingBpm = firstBpm
+        @Volatile private var running = true
+        @Volatile private var doneWriting = false
+        @Volatile private var released = false
+        @Volatile private var totalWritten = 0L
+
+        init {
+            val minBuf = AudioTrack.getMinBufferSize(
+                SR, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
+            )
+            val bufBytes = max(minBuf * 2, 16384)
+            track = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(SR)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build()
+                )
+                .setBufferSizeInBytes(bufBytes)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+            synchronized(segs) { segs.add(Seg(0L, firstBuf.size, firstBpm)) }
         }
 
-        fun finished(): Boolean = !loop && track.playbackHeadPosition >= frames
+        fun start() {
+            track.play()
+            Thread({ pump() }, "HarmonyLabPlayer").start()
+        }
+
+        /** Nuevo contenido del loop: entra al terminar la vuelta actual. */
+        fun queue(shorts: ShortArray, bpm: Int) {
+            pendingBpm = bpm
+            pending = shorts
+        }
+
+        private fun pump() {
+            try {
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+            } catch (e: Exception) { }
+            var buf = firstBuf
+            var pos = 0
+            try {
+                while (running) {
+                    val n = min(CHUNK, buf.size - pos)
+                    val w = track.write(buf, pos, n)
+                    if (w < 0) break
+                    pos += w
+                    totalWritten += w
+                    if (pos >= buf.size) {
+                        if (!isLoop) {
+                            doneWriting = true
+                            break
+                        }
+                        val p = pending
+                        if (p != null) {
+                            pending = null
+                            buf = p
+                            val sb = pendingBpm
+                            synchronized(segs) { segs.add(Seg(totalWritten, p.size, sb)) }
+                        }
+                        pos = 0
+                    }
+                }
+                // Sin loop: esperar a que termine de sonar lo ya escrito
+                if (doneWriting) {
+                    while (running && track.playbackHeadPosition < totalWritten) Thread.sleep(20)
+                }
+            } catch (e: Exception) {
+            } finally {
+                released = true
+                try { track.stop() } catch (e: Exception) { }
+                try { track.release() } catch (e: Exception) { }
+            }
+        }
+
+        /** Posición actual en pulsos, leída del audio real (sincronía exacta). */
+        fun beat(): Float {
+            if (released) return 0f
+            val head = track.playbackHeadPosition.toLong()
+            var seg: Seg? = null
+            synchronized(segs) { for (s in segs) if (s.start <= head) seg = s }
+            val sg = seg ?: return 0f
+            val f = if (isLoop) (head - sg.start) % sg.frames
+                    else min(head - sg.start, sg.frames.toLong())
+            return f.toFloat() / SR * sg.bpm / 60f
+        }
+
+        fun finished(): Boolean {
+            if (isLoop || !doneWriting) return false
+            return released || track.playbackHeadPosition >= totalWritten
+        }
 
         fun release() {
-            try { track.stop() } catch (e: Exception) { }
-            try { track.release() } catch (e: Exception) { }
+            running = false
+            try { track.pause() } catch (e: Exception) { }
+            try { track.flush() } catch (e: Exception) { }
         }
     }
 
@@ -77,15 +171,15 @@ object PianoSynth {
      * Renderiza todo el piano roll con la duración real de cada nota según el BPM.
      * Es pesado: llamar desde un hilo secundario.
      */
-    fun buildSequence(notes: List<NoteEvent>, bpm: Int, loop: Boolean): Sequence? {
-        if (notes.isEmpty()) return null
+    fun renderSequence(notes: List<NoteEvent>, bpm: Int, loop: Boolean): ShortArray? {
+        if (notes.isEmpty() && !loop) return null
         val spb = 60.0 / bpm
         var endBeat = 0f
         for (n in notes) endBeat = max(endBeat, n.start + n.length)
 
         val frames: Int
         if (loop) {
-            val loopBeats = ceil(endBeat / 4f) * 4f
+            val loopBeats = max(4f, ceil(endBeat / 4f) * 4f)
             frames = (loopBeats * spb * SR).toInt()
         } else {
             frames = ((endBeat * spb + RELEASE + 0.1) * SR).toInt()
@@ -104,13 +198,11 @@ object PianoSynth {
                 mix[idx] += buf[i]
             }
         }
-
-        val shorts = toShorts(mix)
-        val track = makeTrack(shorts.size)
-        track.write(shorts, 0, shorts.size)
-        if (loop) track.setLoopPoints(0, frames, -1)
-        return Sequence(track, frames, bpm, loop)
+        return toShorts(mix)
     }
+
+    fun createSequence(shorts: ShortArray, bpm: Int, loop: Boolean): Sequence =
+        Sequence(shorts, bpm, loop)
 
     // ---------- Síntesis ----------
 
