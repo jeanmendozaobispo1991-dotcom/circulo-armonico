@@ -106,6 +106,7 @@ class ComposerView(context: Context) : View(context) {
 
     // Reproducción
     var bpm = 120
+    var loop = false
     var onPlayState: ((Boolean) -> Unit)? = null
     var isPlaying = false
         private set
@@ -165,23 +166,19 @@ class ComposerView(context: Context) : View(context) {
         }
     }
 
+    private var sequence: PianoSynth.Sequence? = null
+    private var preparing = false
+    private var playToken = 0
+
     private val tick = object : Runnable {
         override fun run() {
             if (!isPlaying) return
-            val now = SystemClock.uptimeMillis()
-            val dt = now - lastTick
-            lastTick = now
-            val prev = playBeat
-            playBeat += dt * bpm / 60000f
-            for (n in notes) {
-                if (n.start > prev && n.start <= playBeat) PianoSynth.play(n.pitch)
-            }
-            var end = 0f
-            for (n in notes) end = max(end, n.start + n.length)
-            if (playBeat > end + 0.05f) {
+            val seq = sequence
+            if (seq == null || seq.finished()) {
                 stop()
                 return
             }
+            playBeat = seq.beat()
             val vb = viewBeats()
             if (playBeat > scrollB + vb * 0.92f || playBeat < scrollB) {
                 scrollB = playBeat - vb * 0.08f
@@ -208,20 +205,44 @@ class ComposerView(context: Context) : View(context) {
     }
 
     fun play() {
-        if (isPlaying || notes.isEmpty()) return
-        isPlaying = true
-        playBeat = -0.001f
-        lastTick = SystemClock.uptimeMillis()
-        scrollB = 0f
-        clampScroll()
+        if (isPlaying || preparing || notes.isEmpty()) return
+        preparing = true
+        val token = ++playToken
+        val snapshot = notes.map { it.copy() }
+        val b = bpm
+        val lp = loop
         onPlayState?.invoke(true)
-        handler.post(tick)
+        Thread {
+            val seq = try { PianoSynth.buildSequence(snapshot, b, lp) } catch (e: Exception) { null }
+            handler.post {
+                if (token != playToken) {
+                    seq?.release()
+                    return@post
+                }
+                preparing = false
+                if (seq == null) {
+                    onPlayState?.invoke(false)
+                    return@post
+                }
+                sequence = seq
+                isPlaying = true
+                playBeat = 0f
+                scrollB = 0f
+                clampScroll()
+                seq.start()
+                handler.post(tick)
+            }
+        }.start()
     }
 
     fun stop() {
-        if (!isPlaying) return
+        if (!isPlaying && !preparing) return
+        playToken++
+        preparing = false
         isPlaying = false
         handler.removeCallbacks(tick)
+        sequence?.release()
+        sequence = null
         onPlayState?.invoke(false)
         invalidate()
     }
@@ -782,7 +803,8 @@ class ComposerView(context: Context) : View(context) {
                 notes.add(NoteEvent((m + pl.second).coerceIn(MIN_P, MAX_P), pl.first, 1f, 100, gid, true))
             }
         }
-        for (m in chordToPlace) PianoSynth.play(m + (pl?.second ?: 0))
+        val shift = pl?.second ?: 0
+        PianoSynth.playChord(IntArray(chordToPlace.size) { chordToPlace[it] + shift })
         chordToPlace = IntArray(0)
     }
 
