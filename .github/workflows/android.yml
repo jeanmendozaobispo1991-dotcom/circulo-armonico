@@ -19,17 +19,16 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - uses: android-actions/setup-android@v3
-
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.9
+          gradle-version: 8.11.1
 
       - name: Build debug APK
-        run: gradle assembleDebug
+        run: gradle assembleDebug --stacktrace
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-
           name: harmony-lab-debug-apk
+
           path: HarmonyLab/app/build/outputs/apk/debug/*.apk
