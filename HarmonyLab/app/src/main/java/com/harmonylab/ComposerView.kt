@@ -109,7 +109,14 @@ class ComposerView(context: Context) : View(context) {
 
     // Reproducción
     var bpm = 120
+        set(v) { field = v; scheduleLive() }
     var loop = false
+    var follow = false
+    var onFollowChanged: ((Boolean) -> Unit)? = null
+    private var builtSig = 0
+    private var builtBpm = 0
+    private var rebuilding = false
+    private var rebuildAgain = false
     var onPlayState: ((Boolean) -> Unit)? = null
     var isPlaying = false
         private set
@@ -182,10 +189,12 @@ class ComposerView(context: Context) : View(context) {
                 return
             }
             playBeat = seq.beat()
-            val vb = viewBeats()
-            if (playBeat > scrollB + vb * 0.92f || playBeat < scrollB) {
-                scrollB = playBeat - vb * 0.08f
-                clampScroll()
+            if (follow) {
+                val vb = viewBeats()
+                if (playBeat > scrollB + vb * 0.92f || playBeat < scrollB) {
+                    scrollB = playBeat - vb * 0.08f
+                    clampScroll()
+                }
             }
             invalidate()
             handler.postDelayed(this, 16)
@@ -204,7 +213,61 @@ class ComposerView(context: Context) : View(context) {
             notes.addAll(history.removeAt(history.lastIndex).map { it.copy() })
             clearResize()
             invalidate()
+            scheduleLive()
         }
+    }
+
+    private fun notesSig(): Int {
+        var h = 17
+        for (n in notes) {
+            h = h * 31 + n.pitch
+            h = h * 31 + n.start.hashCode()
+            h = h * 31 + n.length.hashCode()
+        }
+        return h * 31 + notes.size
+    }
+
+    private fun disableFollow() {
+        if (follow && isPlaying) {
+            follow = false
+            onFollowChanged?.invoke(false)
+        }
+    }
+
+    // ---------- Edición en vivo: el loop se renueva en la siguiente vuelta ----------
+    private val liveRunnable = Runnable { doLive() }
+
+    private fun scheduleLive() {
+        if (!isPlaying) return
+        handler.removeCallbacks(liveRunnable)
+        handler.postDelayed(liveRunnable, 250)
+    }
+
+    private fun doLive() {
+        val seq = sequence ?: return
+        if (!isPlaying || !seq.isLoop) return
+        val sig = notesSig()
+        if (sig == builtSig && bpm == builtBpm) return
+        if (rebuilding) {
+            rebuildAgain = true
+            return
+        }
+        rebuilding = true
+        builtSig = sig
+        builtBpm = bpm
+        val snap = notes.map { it.copy() }
+        val b = bpm
+        Thread {
+            val shorts = try { PianoSynth.renderSequence(snap, b, true) } catch (e: Exception) { null }
+            handler.post {
+                rebuilding = false
+                if (sequence === seq && shorts != null) seq.queue(shorts, b)
+                if (rebuildAgain) {
+                    rebuildAgain = false
+                    scheduleLive()
+                }
+            }
+        }.start()
     }
 
     fun play() {
@@ -214,15 +277,19 @@ class ComposerView(context: Context) : View(context) {
         val snapshot = notes.map { it.copy() }
         val b = bpm
         val lp = loop
+        builtSig = notesSig()
+        builtBpm = b
         onPlayState?.invoke(true)
         Thread {
-            val seq = try { PianoSynth.buildSequence(snapshot, b, lp) } catch (e: Exception) { null }
+            val shorts = try { PianoSynth.renderSequence(snapshot, b, lp) } catch (e: Exception) { null }
             handler.post {
-                if (token != playToken) {
-                    seq?.release()
+                if (token != playToken) return@post
+                preparing = false
+                if (shorts == null) {
+                    onPlayState?.invoke(false)
                     return@post
                 }
-                preparing = false
+                val seq = try { PianoSynth.createSequence(shorts, b, lp) } catch (e: Exception) { null }
                 if (seq == null) {
                     onPlayState?.invoke(false)
                     return@post
@@ -230,8 +297,6 @@ class ComposerView(context: Context) : View(context) {
                 sequence = seq
                 isPlaying = true
                 playBeat = 0f
-                scrollB = 0f
-                clampScroll()
                 seq.start()
                 handler.post(tick)
             }
@@ -244,6 +309,8 @@ class ComposerView(context: Context) : View(context) {
         preparing = false
         isPlaying = false
         handler.removeCallbacks(tick)
+        handler.removeCallbacks(liveRunnable)
+        rebuildAgain = false
         sequence?.release()
         sequence = null
         onPlayState?.invoke(false)
@@ -939,6 +1006,7 @@ class ComposerView(context: Context) : View(context) {
 
         if (a == MotionEvent.ACTION_POINTER_DOWN) {
             handler.removeCallbacks(longPress)
+            disableFollow()
             mode = M_PINCH
             return true
         }
@@ -957,12 +1025,14 @@ class ComposerView(context: Context) : View(context) {
                     val ok = if (expanded) pickChip(e.x, e.y) else pickChord(e.x, e.y)
                     if (ok) {
                         mode = M_CHORD
+                        disableFollow()
                         dragX = e.x; dragY = e.y
                         invalidate()
                     } else mode = M_NONE
                     return true
                 }
 
+                disableFollow()
                 for (g in groupBoxes()) {
                     val p = lockPos(g)
                     if (hypot(e.x - p[0], e.y - p[1]) <= dp(20f)) {
@@ -1036,6 +1106,7 @@ class ComposerView(context: Context) : View(context) {
                 }
                 mode = M_NONE
                 invalidate()
+                scheduleLive()
                 return true
             }
         }
