@@ -21,7 +21,9 @@ class MainActivity : Activity() {
     private lateinit var gridButton: Button
     private lateinit var snapButton: Button
     private lateinit var loopButton: Button
+    private lateinit var followButton: Button
     private var loopOn = false
+    private var followOn = false
 
     private var expanded = false
     private var bpm = 120
@@ -128,11 +130,11 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
         }
         val title = TextView(this).apply {
-            text = "HARMONY LAB"
-            textSize = 18f
+            text = "MIDI Piano Action"
+            textSize = 17f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
-            letterSpacing = 0.08f
+            letterSpacing = 0.02f
         }
         modeButton = styledButton("Modo detallado", panel) {
             expanded = !expanded
@@ -169,21 +171,34 @@ class MainActivity : Activity() {
             gridButton.text = "Rejilla " + gridLabels[gridIdx]
             composer.gridStep = gridSteps[gridIdx]
         }
-        gridButton.textSize = 12f
+        gridButton.textSize = 11f
         snapButton = styledButton("Imán: SÍ", accent) {
             snapOn = !snapOn
             snapButton.text = if (snapOn) "Imán: SÍ" else "Imán: NO"
             paintButton(snapButton, if (snapOn) accent else panel)
             composer.snapOn = snapOn
         }
-        snapButton.textSize = 12f
-        loopButton = styledButton("🔁 Loop: NO", panel) {
+        snapButton.textSize = 11f
+        loopButton = styledButton("Loop: NO", panel) {
             loopOn = !loopOn
-            loopButton.text = if (loopOn) "🔁 Loop: SÍ" else "🔁 Loop: NO"
+            loopButton.text = if (loopOn) "Loop: SÍ" else "Loop: NO"
             paintButton(loopButton, if (loopOn) accent else panel)
             composer.loop = loopOn
         }
-        loopButton.textSize = 12f
+        loopButton.textSize = 11f
+        followButton = styledButton("Seguir: NO", panel) {
+            followOn = !followOn
+            followButton.text = if (followOn) "Seguir: SÍ" else "Seguir: NO"
+            paintButton(followButton, if (followOn) accent else panel)
+            composer.follow = followOn
+        }
+        followButton.textSize = 11f
+        // Si el usuario toca el piano roll mientras suena, el seguimiento se apaga solo
+        composer.onFollowChanged = { on ->
+            followOn = on
+            followButton.text = if (on) "Seguir: SÍ" else "Seguir: NO"
+            paintButton(followButton, if (on) accent else panel)
+        }
 
         transport.addView(playButton, weight(1.5f))
         transport.addView(repeatButton("−", -1), weight(0.7f))
@@ -196,6 +211,7 @@ class MainActivity : Activity() {
         row2.addView(gridButton, weight(1f))
         row2.addView(snapButton, weight(1f))
         row2.addView(loopButton, weight(1f))
+        row2.addView(followButton, weight(1f))
         page.addView(row2, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(6) })
 
         page.addView(composer, LinearLayout.LayoutParams(-1, 0, 1f))
