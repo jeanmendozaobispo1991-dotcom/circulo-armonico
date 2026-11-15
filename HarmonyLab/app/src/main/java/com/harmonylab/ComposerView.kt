@@ -78,6 +78,9 @@ class ComposerView(context: Context) : View(context) {
     private var resizeIdx = -1
     private var resizeOrig = 1f
     private var resizeBaseX = 0f
+    private var resizeGroup = 0
+    private var rTargets: List<NoteEvent> = emptyList()
+    private var rOrig = FloatArray(0)
     private var lastLen = 1f
     private var lastTapNote: NoteEvent? = null
     private var lastTapTime = 0L
@@ -155,11 +158,11 @@ class ComposerView(context: Context) : View(context) {
     private val longPress = Runnable {
         if (mode == M_NOTE && !moved) {
             val n = notes.getOrNull(downIdx)
-            if (n != null && !(n.group > 0 && n.locked)) {
+            if (n != null) {
                 mode = M_RESIZE
                 resizeIdx = downIdx
-                resizeOrig = n.length
-                resizeBaseX = downX
+                resizeGroup = if (n.group > 0 && n.locked) n.group else 0
+                beginResize(downX)
                 performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
                 invalidate()
             }
@@ -199,7 +202,7 @@ class ComposerView(context: Context) : View(context) {
         if (history.isNotEmpty()) {
             notes.clear()
             notes.addAll(history.removeAt(history.lastIndex).map { it.copy() })
-            resizeIdx = -1
+            clearResize()
             invalidate()
         }
     }
@@ -649,7 +652,7 @@ class ComposerView(context: Context) : View(context) {
             val lockedGroup = n.group > 0 && n.locked
             paint.style = Paint.Style.FILL
             paint.color = when {
-                index == resizeIdx -> Color.rgb(130, 185, 255)
+                index == resizeIdx && resizeGroup == 0 -> Color.rgb(130, 185, 255)
                 lockedGroup -> cOrange
                 else -> cAccent
             }
@@ -687,10 +690,10 @@ class ComposerView(context: Context) : View(context) {
         }
 
         // Ícono ↔ para estirar la nota
-        val rn = notes.getOrNull(resizeIdx)
-        if (rn != null) {
-            val hx = xOf(rn.start + rn.length)
-            val hy = yTop(rn.pitch) + rowH / 2f
+        val hi = handleInfo()
+        if (hi != null) {
+            val hx = hi[0]
+            val hy = hi[1]
             paint.style = Paint.Style.FILL
             paint.color = Color.WHITE
             c.drawCircle(hx, hy, dp(13f), paint)
@@ -832,7 +835,7 @@ class ComposerView(context: Context) : View(context) {
                 notes.removeAll { it === n }
             }
             lastTapNote = null
-            resizeIdx = -1
+            clearResize()
         } else {
             lastTapNote = n
             lastTapTime = now
@@ -845,7 +848,7 @@ class ComposerView(context: Context) : View(context) {
         saveHistory()
         val newState = !first.locked
         for (n in notes) if (n.group == id) n.locked = newState
-        resizeIdx = -1
+        clearResize()
     }
 
     private fun moveSelected(x: Float, y: Float) {
@@ -875,14 +878,41 @@ class ComposerView(context: Context) : View(context) {
         }
     }
 
+    private fun clearResize() { resizeIdx = -1; resizeGroup = 0 }
+
+    private fun beginResize(baseX: Float) {
+        rTargets = if (resizeGroup > 0) notes.filter { it.group == resizeGroup }
+                   else listOfNotNull(notes.getOrNull(resizeIdx))
+        rOrig = FloatArray(rTargets.size) { rTargets[it].length }
+        resizeBaseX = baseX
+    }
+
+    // Posición del ícono ↔: [x, y, mitad del alto]. Nota suelta o bloque completo.
+    private fun handleInfo(): FloatArray? {
+        if (resizeGroup > 0) {
+            val g = groupBoxes().firstOrNull { it.id == resizeGroup } ?: return null
+            val top = yTop(g.maxPitch)
+            val bottom = yTop(g.minPitch) + rowH
+            return floatArrayOf(xOf(g.maxEnd), (top + bottom) / 2f, (bottom - top) / 2f)
+        }
+        val n = notes.getOrNull(resizeIdx) ?: return null
+        return floatArrayOf(xOf(n.start + n.length), yTop(n.pitch) + rowH / 2f, rowH / 2f)
+    }
+
     private fun resizeTo(x: Float) {
-        val n = notes.getOrNull(resizeIdx) ?: return
+        if (rTargets.isEmpty()) return
         ensureHistory()
         val minLen = if (snapOn) gridStep else 0.0625f
-        val end = snapBeat(n.start + resizeOrig + (x - resizeBaseX) / ppb)
-        val newLen = clampF(end - n.start, minLen, TOTAL - n.start)
-        n.length = newLen
-        lastLen = newLen
+        var maxEnd = 0f
+        var minOrig = Float.MAX_VALUE
+        for (i in rTargets.indices) {
+            maxEnd = max(maxEnd, rTargets[i].start + rOrig[i])
+            minOrig = min(minOrig, rOrig[i])
+        }
+        var dL = snapBeat(maxEnd + (x - resizeBaseX) / ppb) - maxEnd
+        dL = clampF(dL, minLen - minOrig, TOTAL - maxEnd)
+        for (i in rTargets.indices) rTargets[i].length = rOrig[i] + dL
+        lastLen = rTargets[0].length
     }
 
     private fun findNote(x: Float, y: Float): Int {
@@ -897,10 +927,9 @@ class ComposerView(context: Context) : View(context) {
         return -1
     }
 
-    private fun onHandle(n: NoteEvent, x: Float, y: Float): Boolean {
-        val hx = xOf(n.start + n.length)
-        val t = yTop(n.pitch)
-        return abs(x - hx) <= dp(26f) && y >= t - dp(12f) && y <= t + rowH + dp(12f)
+    private fun onHandle(x: Float, y: Float): Boolean {
+        val h = handleInfo() ?: return false
+        return abs(x - h[0]) <= dp(26f) && abs(y - h[1]) <= h[2] + dp(12f)
     }
 
     // ---------- Toques ----------
@@ -944,11 +973,9 @@ class ComposerView(context: Context) : View(context) {
                 }
 
                 if (resizeIdx >= 0) {
-                    val rn = notes.getOrNull(resizeIdx)
-                    if (rn != null && onHandle(rn, e.x, e.y)) {
+                    if (onHandle(e.x, e.y)) {
                         mode = M_RESIZE
-                        resizeOrig = rn.length
-                        resizeBaseX = e.x
+                        beginResize(e.x)
                         return true
                     }
                     exitResize = true
@@ -964,7 +991,7 @@ class ComposerView(context: Context) : View(context) {
                     origP = IntArray(moving.size) { moving[it].pitch }
                     lastDP = 0
                     mode = M_NOTE
-                    if (!lockedGroup) handler.postDelayed(longPress, 420)
+                    handler.postDelayed(longPress, 420)
                 } else {
                     mode = M_EMPTY
                     panB = scrollB
@@ -977,7 +1004,7 @@ class ComposerView(context: Context) : View(context) {
                 if (!moved && hypot(e.x - downX, e.y - downY) > slop) {
                     moved = true
                     handler.removeCallbacks(longPress)
-                    if (exitResize) resizeIdx = -1
+                    if (exitResize) clearResize()
                 }
                 when (mode) {
                     M_CHORD -> { dragX = e.x; dragY = e.y; invalidate() }
@@ -997,7 +1024,7 @@ class ComposerView(context: Context) : View(context) {
                 handler.removeCallbacks(longPress)
                 if (a == MotionEvent.ACTION_UP) {
                     if (exitResize && !moved && (mode == M_NOTE || mode == M_EMPTY)) {
-                        resizeIdx = -1
+                        clearResize()
                     } else {
                         when (mode) {
                             M_CHORD -> dropChord(e.x, e.y)
