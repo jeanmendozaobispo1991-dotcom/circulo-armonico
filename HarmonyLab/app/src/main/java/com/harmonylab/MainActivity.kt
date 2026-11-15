@@ -20,6 +20,8 @@ class MainActivity : Activity() {
     private lateinit var bpmText: TextView
     private lateinit var gridButton: Button
     private lateinit var snapButton: Button
+    private lateinit var loopButton: Button
+    private var loopOn = false
 
     private var expanded = false
     private var bpm = 120
@@ -175,6 +177,13 @@ class MainActivity : Activity() {
             composer.snapOn = snapOn
         }
         snapButton.textSize = 12f
+        loopButton = styledButton("🔁 Loop: NO", panel) {
+            loopOn = !loopOn
+            loopButton.text = if (loopOn) "🔁 Loop: SÍ" else "🔁 Loop: NO"
+            paintButton(loopButton, if (loopOn) accent else panel)
+            composer.loop = loopOn
+        }
+        loopButton.textSize = 12f
 
         transport.addView(playButton, weight(1.5f))
         transport.addView(repeatButton("−", -1), weight(0.7f))
@@ -186,6 +195,7 @@ class MainActivity : Activity() {
         val row2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         row2.addView(gridButton, weight(1f))
         row2.addView(snapButton, weight(1f))
+        row2.addView(loopButton, weight(1f))
         page.addView(row2, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(6) })
 
         page.addView(composer, LinearLayout.LayoutParams(-1, 0, 1f))
